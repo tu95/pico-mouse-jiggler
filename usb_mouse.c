@@ -1,0 +1,419 @@
+/**
+ * Copyright (c) 2020 Raspberry Pi (Trading) Ltd.
+ *
+ * SPDX-License-Identifier: BSD-3-Clause
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+
+#include "pico/stdlib.h"
+#include "hardware/gpio.h"
+#include "hardware/pio.h"
+#include "hardware/clocks.h"
+#include "bsp/board_api.h"
+#include "tusb.h"
+#include "ws2812.pio.h"
+
+// WS2812 LED 接到 GP16
+#define WS2812_PIN 16
+#define NUM_PIXELS 1
+#define IS_RGBW false
+
+// 鼠标移动参数
+#define MOVEMENT_INTERVAL_MS 500
+#define MAX_MOVEMENT 500
+#define WS_ACTIVITY_FLASH_MS 50
+#define WS_BOOTSEL_FLASH_MS 150
+#define BOOTSEL_POLL_INTERVAL_MS 10
+#define BOOTSEL_TOGGLE_GUARD_MS 300
+
+// HID 配置
+#define REPORT_ID_MOUSE 1
+
+// BOOTSEL 长按定时（毫秒）
+#define BOOTSEL_LONG_PRESS_MS 3000
+
+// WS2812 相关全局变量
+PIO ws2812_pio;
+uint ws2812_sm;
+uint ws2812_offset;
+#define WS2812_FREQ 800000
+
+// 鼠标移动状态
+int8_t mouse_x = 0;
+int8_t mouse_y = 0;
+uint32_t last_movement_time = 0;
+
+// 颜色常量（RGB 输入，函数中转换为 GRB）
+#define COLOR_RED      0xff0000
+#define COLOR_GREEN    0x00ff00
+#define COLOR_BLUE     0x0000ff
+#define COLOR_WHITE    0xffffff
+#define COLOR_OFF      0x000000
+#define COLOR_AMBER    0xff8000
+#define COLOR_YELLOW   0xffff00
+#define COLOR_PURPLE   0xff00ff
+#define COLOR_RED_DIM  0x200000  // 低亮度红色，用于“未工作”提示
+// 颜色含义：琥珀=启动、蓝=USB 准备、绿=主机连接、紫=活动、黄=挂起、红=错误
+
+typedef enum {
+    WS_LOG_BOOTING,
+    WS_LOG_USB_READY,
+    WS_LOG_HOST_READY,
+    WS_LOG_ACTIVITY,
+    WS_LOG_SUSPENDED,
+    WS_LOG_ERROR
+} ws_log_state_t;
+
+static bool usb_host_mounted = false;
+static bool usb_suspended = false;
+static bool random_movement_enabled = false;
+static bool bootsel_last_level = false;
+static uint32_t bootsel_last_toggle_ms = 0;
+static uint32_t ws_activity_duration_ms = 0;
+static bool ws_activity_flash = false;
+static uint32_t ws_activity_timestamp = 0;
+
+static inline void put_pixel(uint32_t pixel_grb) {
+    pio_sm_put_blocking(ws2812_pio, ws2812_sm, pixel_grb << 8u);
+}
+
+static inline uint32_t rgb_to_grb(uint32_t rgb_color) {
+    uint8_t r = (rgb_color >> 16) & 0xff;
+    uint8_t g = (rgb_color >> 8) & 0xff;
+    uint8_t b = rgb_color & 0xff;
+    return (g << 16) | (r << 8) | b;
+}
+
+// 这是一个颜色变暗函数。它接收一个 24 位 RGB 颜色值（格式 0xRRGGBB），并将每个颜色通道右移 shift_bits 位，实现整体亮度的降低（变暗）。
+// 例如 shift_bits=1 时亮度减半，shift_bits=2 时变为 1/4。
+// 返回依然是 0xRRGGBB 格式的 dim 后的颜色。
+static inline uint32_t dim_color(uint32_t rgb_color, uint8_t shift_bits) {
+    uint8_t r = ((rgb_color >> 16) & 0xff) >> shift_bits; // 取出红色分量并右移
+    uint8_t g = ((rgb_color >> 8) & 0xff) >> shift_bits;  // 取出绿色分量并右移
+    uint8_t b = (rgb_color & 0xff) >> shift_bits;         // 取出蓝色分量并右移
+    return (r << 16) | (g << 8) | b;                      // 合成为新的 RGB 值
+}
+
+bool ws2812_init() {
+    printf("正在使用官方 PIO 程序初始化 GP%d 上的 WS2812...\n", WS2812_PIN);
+
+    bool success = pio_claim_free_sm_and_add_program_for_gpio_range(
+        &ws2812_program, &ws2812_pio, &ws2812_sm, &ws2812_offset, WS2812_PIN, 1, true);
+
+    if (!success) {
+        printf("申请 PIO 或状态机失败，WS2812 无法初始化\n");
+        return false;
+    }
+
+    ws2812_program_init(ws2812_pio, ws2812_sm, ws2812_offset, WS2812_PIN, WS2812_FREQ, IS_RGBW);
+    printf("WS2812 初始化完成（频率 %u Hz）\n", WS2812_FREQ);
+    return true;
+}
+
+// 设置 LED 颜色（RGB 输入，函数内会转换成 GRB）
+void set_led_color(uint32_t rgb_color) {
+    uint32_t grb = rgb_to_grb(rgb_color);
+    put_pixel(grb);
+}
+
+static void ws2812_log_state(ws_log_state_t state) {
+    switch (state) {
+        case WS_LOG_BOOTING:
+            set_led_color(COLOR_AMBER);
+            break;
+        case WS_LOG_USB_READY:
+            set_led_color(COLOR_BLUE);
+            break;
+        case WS_LOG_HOST_READY:
+            set_led_color(COLOR_GREEN);
+            break;
+        case WS_LOG_ACTIVITY:
+            set_led_color(COLOR_PURPLE);
+            break;
+        case WS_LOG_SUSPENDED:
+            set_led_color(COLOR_YELLOW);
+            break;
+        case WS_LOG_ERROR:
+        default:
+            set_led_color(COLOR_RED);
+            break;
+    }
+}
+
+static void ws2812_restore_status_color(void) {
+    if (usb_suspended) {
+        ws2812_log_state(WS_LOG_SUSPENDED);
+        return;
+    }
+
+    // 根据工作状态显示颜色：关闭时红色，开启时绿色
+    if (random_movement_enabled) {
+        set_led_color(dim_color(COLOR_GREEN, 3));  // 开启时一直显示绿色
+    } else {
+        set_led_color(dim_color(COLOR_RED, 2));  // 关闭时显示较暗的红色
+    }
+}
+
+static void ws2812_flash_state(ws_log_state_t state, uint32_t duration_ms) {
+    ws2812_log_state(state);
+    ws_activity_flash = true;
+    ws_activity_timestamp = board_millis();
+    ws_activity_duration_ms = duration_ms;
+}
+
+static void ws2812_status_task(void) {
+    if (!ws_activity_flash) {
+        return;
+    }
+
+    if (board_millis() - ws_activity_timestamp >= ws_activity_duration_ms) {
+        ws_activity_flash = false;
+        ws2812_restore_status_color();
+    }
+}
+
+static int8_t random_delta(void) {
+    int delta;
+    do {
+        delta = (int)(rand() % (2 * MAX_MOVEMENT + 1)) - MAX_MOVEMENT;
+    } while (delta == 0);
+    return (int8_t)delta;
+}
+
+// 随机鼠标移动生成器（返回 true 表示本次生成了新的位移）
+bool generate_movement(void) {
+    uint32_t current_time = board_millis();
+
+    if (!random_movement_enabled) {
+        return false;
+    }
+
+    if (current_time - last_movement_time < MOVEMENT_INTERVAL_MS) {
+        return false;
+    }
+
+    mouse_x = random_delta();
+    mouse_y = random_delta();
+    last_movement_time = current_time;
+    return true;
+}
+
+static void bootsel_task(void) {
+    static uint32_t last_poll_ms = 0;
+    uint32_t now = board_millis();
+
+    if (now - last_poll_ms < BOOTSEL_POLL_INTERVAL_MS) {
+        ws2812_status_task();
+        return;
+    }
+    last_poll_ms = now;
+
+    bool pressed = board_button_read() != 0;
+
+    if (pressed && !bootsel_last_level) {
+        if (now - bootsel_last_toggle_ms > BOOTSEL_TOGGLE_GUARD_MS) {
+            random_movement_enabled = !random_movement_enabled;
+            bootsel_last_toggle_ms = now;
+
+            if (random_movement_enabled) {
+                last_movement_time = now - MOVEMENT_INTERVAL_MS;
+            }
+
+            ws2812_flash_state(
+                random_movement_enabled ? WS_LOG_ACTIVITY :
+                (usb_host_mounted ? WS_LOG_HOST_READY : WS_LOG_USB_READY),
+                WS_BOOTSEL_FLASH_MS);
+        }
+    }
+
+    bootsel_last_level = pressed;
+    ws2812_status_task();
+}
+
+static void hid_task(void) {
+    const uint32_t interval_ms = 10;
+    static uint32_t start_ms = 0;
+
+    if (board_millis() - start_ms < interval_ms) {
+        return;
+    }
+    start_ms += interval_ms;
+
+    if (!tud_hid_ready()) {
+        return;
+    }
+
+    if (!random_movement_enabled) {
+        return;
+    }
+
+    bool moved = generate_movement();
+    tud_hid_mouse_report(REPORT_ID_MOUSE, 0, mouse_x, mouse_y, 0, 0);
+    if (moved) {
+        ws2812_flash_state(WS_LOG_ACTIVITY, WS_ACTIVITY_FLASH_MS);
+    }
+    mouse_x = 0;
+    mouse_y = 0;
+}
+
+int main(void) {
+    // 初始化板级外设（GPIO、电源等）
+    board_init();
+
+    // 初始化 WS2812，失败则停机并保持红灯
+    if (!ws2812_init()) {
+        ws2812_log_state(WS_LOG_ERROR);
+        while (1) {
+            tight_loop_contents();
+        }
+    }
+    ws2812_log_state(WS_LOG_BOOTING);
+
+    // 用系统时间作为随机数种子
+    srand(to_ms_since_boot(get_absolute_time()));
+
+    // 初始化 TinyUSB，若板卡需要额外设置则在其后执行
+    tusb_init();
+    if (board_init_after_tusb) {
+        board_init_after_tusb();
+    }
+    ws2812_restore_status_color();
+
+    // 主循环：维持 TinyUSB、随机鼠标和 Bootsel 控制
+    while (true) {
+        tud_task();       // USB 协议栈
+        hid_task();       // HID 报告生成
+        bootsel_task();   // Bootsel 轮询用于启停随机移动
+    }
+}
+
+// USB 设备事件回调
+void tud_mount_cb(void) {
+    printf("\n>>> USB Mounted - LED GREEN <<<\n");
+    usb_host_mounted = true;
+    usb_suspended = false;
+    ws2812_restore_status_color();
+}
+
+void tud_umount_cb(void) {
+    printf("\n>>> USB Unmounted - LED BLUE <<<\n");
+    usb_host_mounted = false;
+    usb_suspended = false;
+    ws2812_restore_status_color();
+}
+
+void tud_suspend_cb(bool remote_wakeup_en) {
+    (void) remote_wakeup_en;
+    printf("\n>>> USB Suspended - LED YELLOW <<<\n");
+    usb_suspended = true;
+    ws2812_restore_status_color();
+}
+
+void tud_resume_cb(void) {
+    printf("\n>>> USB Resumed - LED GREEN <<<\n");
+    usb_suspended = false;
+    ws2812_restore_status_color();
+}
+
+// TinyUSB 描述符回调
+tusb_desc_device_t const desc_device = {
+    .bLength            = sizeof(tusb_desc_device_t),
+    .bDescriptorType    = TUSB_DESC_DEVICE,
+    .bcdUSB             = 0x0200,
+    .bDeviceClass       = 0x00,
+    .bDeviceSubClass    = 0x00,
+    .bDeviceProtocol    = 0x00,
+    .bMaxPacketSize0    = CFG_TUD_ENDPOINT0_SIZE,
+    .idVendor           = 0x046d, // Logitech
+    .idProduct          = 0xc539, // G304 Lightspeed Receiver
+    .bcdDevice          = 0x0100,
+    .iManufacturer      = 0x01,
+    .iProduct           = 0x02,
+    .iSerialNumber      = 0x03,
+    .bNumConfigurations = 0x01
+};
+
+const uint8_t* tud_descriptor_device_cb(void) {
+    return (uint8_t const*) &desc_device;
+}
+
+// HID 报告描述符
+const uint8_t desc_hid_report[] = {
+    TUD_HID_REPORT_DESC_MOUSE(HID_REPORT_ID(REPORT_ID_MOUSE))
+};
+
+const uint8_t* tud_hid_descriptor_report_cb(uint8_t instance) {
+    (void) instance;
+    return desc_hid_report;
+}
+
+// 配置描述符
+uint8_t const desc_configuration[] = {
+    // 配置编号、接口数量、字符串索引、总长、属性、供电 mA
+    TUD_CONFIG_DESCRIPTOR(1, 1, 0, TUD_CONFIG_DESC_LEN + TUD_HID_DESC_LEN, TUSB_DESC_CONFIG_ATT_REMOTE_WAKEUP, 100),
+
+    // 接口编号、字符串索引、协议、报告描述符长度、端点地址、容量与轮询周期
+    TUD_HID_DESCRIPTOR(0, 0, HID_ITF_PROTOCOL_MOUSE, sizeof(desc_hid_report), 0x81, CFG_TUD_HID_EP_BUFSIZE, 10)
+};
+
+uint8_t const* tud_descriptor_configuration_cb(uint8_t index) {
+    (void) index;
+    return desc_configuration;
+}
+
+// 字符串描述符
+const uint16_t* tud_descriptor_string_cb(uint8_t index, uint16_t langid) {
+    (void) langid;
+
+    #define DESC_STR_MAX (20)
+    static uint16_t desc_str[DESC_STR_MAX];
+
+    static char const* string_desc_arr[] = {
+        "\x09\x04",                      // 0：语言 ID（英文 0x0409）
+        "Logitech",                      // 1：厂商
+        "Logitech G304",                 // 2：产品名
+        "C539-001",                      // 3：序列号
+    };
+
+    uint8_t chr_count;
+
+    if (index == 0) {
+        memcpy(&desc_str[1], string_desc_arr[0], 2);
+        chr_count = 1;
+    } else {
+        if (!(index < sizeof(string_desc_arr)/sizeof(string_desc_arr[0]))) return NULL;
+
+        const char* str = string_desc_arr[index];
+
+        chr_count = strlen(str);
+        if ( chr_count > (DESC_STR_MAX-1) ) chr_count = DESC_STR_MAX-1;
+
+        for(uint8_t i=0; i<chr_count; i++) {
+            desc_str[1+i] = str[i];
+        }
+    }
+
+    desc_str[0] = (TUSB_DESC_STRING << 8 ) | (2*chr_count + 2);
+
+    return desc_str;
+}
+
+// HID 回调
+uint16_t tud_hid_get_report_cb(uint8_t instance, uint8_t report_id, hid_report_type_t report_type, uint8_t* buffer, uint16_t reqlen) {
+    (void) instance;
+    (void) report_id;
+    (void) report_type;
+    (void) buffer;
+    (void) reqlen;
+    return 0;
+}
+
+void tud_hid_set_report_cb(uint8_t instance, uint8_t report_id, hid_report_type_t report_type, uint8_t const* buffer, uint16_t bufsiz) {
+    (void) instance;
+    (void) report_id;
+    (void) report_type;
+    (void) buffer;
+    (void) bufsiz;
+}
