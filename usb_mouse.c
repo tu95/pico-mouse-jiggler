@@ -150,9 +150,9 @@ static void ws2812_restore_status_color(void) {
 
     // 根据工作状态显示颜色：关闭时红色，开启时绿色
     if (random_movement_enabled) {
-        set_led_color(dim_color(COLOR_GREEN, 3));  // 开启时一直显示绿色
+        set_led_color(dim_color(COLOR_GREEN, 1));  // 开启时一直显示绿色
     } else {
-        set_led_color(dim_color(COLOR_RED, 2));  // 关闭时显示较暗的红色
+        set_led_color(dim_color(COLOR_RED, 1));  // 关闭时显示较暗的红色
     }
 }
 

@@ -18,6 +18,46 @@ A USB mouse device based on Raspberry Pi Pico RP2040 that automatically moves th
 - **即插即用**: 无需安装额外驱动程序
 - **WS2812 LED 状态指示**: 通过 WS2812 LED 显示设备工作状态
 
+## Building / 构建
+
+This project uses CMake with Ninja build system. / 本项目使用 CMake 和 Ninja 构建系统。
+
+### Prerequisites / 前置要求
+- CMake 3.13 or later / CMake 3.13 或更高版本
+- Ninja build system / Ninja 构建系统
+- Raspberry Pi Pico SDK / Raspberry Pi Pico SDK
+- ARM GCC toolchain / ARM GCC 工具链
+
+### Build Steps / 构建步骤
+
+1. **Configure the project / 配置项目**:
+   ```bash
+   mkdir build
+   cd build
+   cmake -GNinja ..
+   ```
+
+2. **Build the project / 编译项目**:
+   ```bash
+   ninja
+   ```
+
+   Or use CMake build command / 或使用 CMake 构建命令:
+   ```bash
+   cmake --build .
+   ```
+
+3. **Output files / 输出文件**:
+   - `usb_mouse.uf2` - Firmware file for Pico / Pico 固件文件
+   - `usb_mouse.elf` - ELF binary / ELF 二进制文件
+   - `usb_mouse.hex` - Intel HEX format / Intel HEX 格式
+
+### Upload to Pico / 上传到 Pico
+
+1. Press and hold the BOOTSEL button on your Pico / 按住 Pico 上的 BOOTSEL 按键
+2. Connect the Pico to your computer via USB / 通过 USB 将 Pico 连接到电脑
+3. Drag the `usb_mouse.uf2` file to the Pico drive / 将 `usb_mouse.uf2` 文件拖拽到 Pico 驱动器
+
 ## WS2812 LED / WS2812 LED 指示灯
 
 ### Pin Connection / 引脚连接
