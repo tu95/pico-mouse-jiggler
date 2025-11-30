@@ -120,12 +120,12 @@ void set_led_color(uint32_t rgb_color) {
 
 static void ws2812_log_state(ws_log_state_t state) {
     switch (state) {
-        case WS_LOG_BOOTING:
-            set_led_color(COLOR_AMBER);
-            break;
-        case WS_LOG_USB_READY:
-            set_led_color(COLOR_BLUE);
-            break;
+            case WS_LOG_BOOTING:
+                set_led_color(COLOR_AMBER);
+                break;
+            case WS_LOG_USB_READY:
+                set_led_color(COLOR_BLUE);
+                break;
         case WS_LOG_HOST_READY:
             set_led_color(COLOR_GREEN);
             break;
@@ -148,7 +148,15 @@ static void ws2812_restore_status_color(void) {
         return;
     }
 
-    // 根据工作状态显示颜色：关闭时红色，开启时绿色
+    // 使用 usb_host_mounted 标志判断USB连接状态（在回调中设置，更稳定）
+    // 不使用 tud_hid_ready() 因为它在USB协议栈处理间隙可能短暂返回false，导致闪烁
+    if (!usb_host_mounted) {
+        // USB未挂载，显示蓝色（USB准备状态）
+        ws2812_log_state(WS_LOG_USB_READY);
+        return;
+    }
+
+    // USB已挂载，根据工作状态显示颜色：关闭时红色，开启时绿色
     if (random_movement_enabled) {
         set_led_color(dim_color(COLOR_GREEN, 1));  // 开启时一直显示绿色
     } else {
@@ -249,11 +257,8 @@ static void hid_task(void) {
         return;
     }
 
-    bool moved = generate_movement();
+    generate_movement();
     tud_hid_mouse_report(REPORT_ID_MOUSE, 0, mouse_x, mouse_y, 0, 0);
-    if (moved) {
-        ws2812_flash_state(WS_LOG_ACTIVITY, WS_ACTIVITY_FLASH_MS);
-    }
     mouse_x = 0;
     mouse_y = 0;
 }

@@ -34,17 +34,18 @@ This project uses CMake with Ninja build system. / 本项目使用 CMake 和 Nin
    ```bash
    mkdir build
    cd build
-   cmake -GNinja ..
+   cmake .. -G "Ninja"
    ```
 
 2. **Build the project / 编译项目**:
    ```bash
-   ninja
+   ninja -j10
    ```
 
-   Or use CMake build command / 或使用 CMake 构建命令:
+3. **Build the project / 烧录到板子**:
+先长按BOOTSEL按钮，再连接电脑
    ```bash
-   cmake --build .
+   ninja flash
    ```
 
 3. **Output files / 输出文件**:
