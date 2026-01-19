@@ -21,12 +21,14 @@
 #define IS_RGBW false
 
 // 鼠标移动参数
-#define MOVEMENT_INTERVAL_MS 500
+#define MOVEMENT_INTERVAL_MS 600000  // 10分钟 = 600000毫秒
 #define MAX_MOVEMENT 500
 #define WS_ACTIVITY_FLASH_MS 50
 #define WS_BOOTSEL_FLASH_MS 150
 #define BOOTSEL_POLL_INTERVAL_MS 10
 #define BOOTSEL_TOGGLE_GUARD_MS 300
+#define SHAKE_MOVEMENT_COUNT 5  // 晃动时的移动次数
+#define SHAKE_MOVEMENT_DELAY_MS 20  // 晃动时每次移动的间隔
 
 // HID 配置
 #define REPORT_ID_MOUSE 1
@@ -44,6 +46,9 @@ uint ws2812_offset;
 int8_t mouse_x = 0;
 int8_t mouse_y = 0;
 uint32_t last_movement_time = 0;
+static bool shake_in_progress = false;
+static uint32_t shake_start_time = 0;
+static uint8_t shake_step = 0;
 
 // 颜色常量（RGB 输入，函数中转换为 GRB）
 #define COLOR_RED      0xff0000
@@ -190,7 +195,50 @@ static int8_t random_delta(void) {
     return (int8_t)delta;
 }
 
-// 随机鼠标移动生成器（返回 true 表示本次生成了新的位移）
+// 触发鼠标晃动
+void trigger_mouse_shake(void) {
+    shake_in_progress = true;
+    shake_start_time = board_millis();
+    shake_step = 0;
+    random_movement_enabled = true;  // 启用自动移动功能
+    last_movement_time = board_millis() - MOVEMENT_INTERVAL_MS;  // 重置定时器
+}
+
+// 处理鼠标晃动
+bool process_mouse_shake(void) {
+    if (!shake_in_progress) {
+        return false;
+    }
+
+    uint32_t now = board_millis();
+    
+    // 检查是否到了下一次晃动步骤的时间
+    if (now - shake_start_time < shake_step * SHAKE_MOVEMENT_DELAY_MS) {
+        return false;
+    }
+
+    if (shake_step < SHAKE_MOVEMENT_COUNT) {
+        // 生成晃动移动：小范围的随机移动
+        int8_t shake_x = (int8_t)((rand() % 7) - 3);  // -3 到 3
+        int8_t shake_y = (int8_t)((rand() % 7) - 3);  // -3 到 3
+        
+        // 确保至少有一个方向有移动
+        if (shake_x == 0 && shake_y == 0) {
+            shake_x = 1;
+        }
+        
+        mouse_x = shake_x;
+        mouse_y = shake_y;
+        shake_step++;
+        return true;
+    } else {
+        // 晃动完成
+        shake_in_progress = false;
+        return false;
+    }
+}
+
+// 鼠标移动生成器（每10分钟移动1像素，防止息屏）
 bool generate_movement(void) {
     uint32_t current_time = board_millis();
 
@@ -198,12 +246,25 @@ bool generate_movement(void) {
         return false;
     }
 
+    // 如果正在晃动，不执行定时移动
+    if (shake_in_progress) {
+        return false;
+    }
+
     if (current_time - last_movement_time < MOVEMENT_INTERVAL_MS) {
         return false;
     }
 
-    mouse_x = random_delta();
-    mouse_y = random_delta();
+    // 每10分钟只移动1个像素点，交替在x和y方向移动
+    static bool move_x = true;
+    if (move_x) {
+        mouse_x = 1;
+        mouse_y = 0;
+    } else {
+        mouse_x = 0;
+        mouse_y = 1;
+    }
+    move_x = !move_x;
     last_movement_time = current_time;
     return true;
 }
@@ -222,17 +283,18 @@ static void bootsel_task(void) {
 
     if (pressed && !bootsel_last_level) {
         if (now - bootsel_last_toggle_ms > BOOTSEL_TOGGLE_GUARD_MS) {
-            random_movement_enabled = !random_movement_enabled;
+            // 切换开关状态
+            if (random_movement_enabled) {
+                // 关闭：停止晃动和自动移动
+                random_movement_enabled = false;
+                shake_in_progress = false;
+            } else {
+                // 开启：触发晃动并启用自动移动
+                trigger_mouse_shake();
+            }
             bootsel_last_toggle_ms = now;
 
-            if (random_movement_enabled) {
-                last_movement_time = now - MOVEMENT_INTERVAL_MS;
-            }
-
-            ws2812_flash_state(
-                random_movement_enabled ? WS_LOG_ACTIVITY :
-                (usb_host_mounted ? WS_LOG_HOST_READY : WS_LOG_USB_READY),
-                WS_BOOTSEL_FLASH_MS);
+            ws2812_flash_state(WS_LOG_ACTIVITY, WS_BOOTSEL_FLASH_MS);
         }
     }
 
@@ -257,10 +319,19 @@ static void hid_task(void) {
         return;
     }
 
-    generate_movement();
-    tud_hid_mouse_report(REPORT_ID_MOUSE, 0, mouse_x, mouse_y, 0, 0);
-    mouse_x = 0;
-    mouse_y = 0;
+    // 优先处理晃动
+    bool movement_generated = process_mouse_shake();
+    
+    // 如果没有晃动，则执行定时移动
+    if (!movement_generated) {
+        movement_generated = generate_movement();
+    }
+
+    if (movement_generated) {
+        tud_hid_mouse_report(REPORT_ID_MOUSE, 0, mouse_x, mouse_y, 0, 0);
+        mouse_x = 0;
+        mouse_y = 0;
+    }
 }
 
 int main(void) {
